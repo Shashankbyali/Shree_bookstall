@@ -52,8 +52,8 @@ export function OwnerDashboard() {
 
   const selected = jobs.find((j) => j.id === selectedId) ?? null;
 
-  const loadJobs = useCallback(async () => {
-    setLoading(true);
+  const loadJobs = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     setError("");
     try {
       const qs = filter !== "all" ? `?status=${filter}` : "";
@@ -68,21 +68,16 @@ export function OwnerDashboard() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load jobs");
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [filter, router]);
 
   useEffect(() => {
-    const initialId = setTimeout(() => {
-      void loadJobs();
-    }, 0);
+    void loadJobs(false);
     const id = setInterval(() => {
-      void loadJobs();
-    }, 15000);
-    return () => {
-      clearTimeout(initialId);
-      clearInterval(id);
-    };
+      void loadJobs(true);
+    }, 20000);
+    return () => clearInterval(id);
   }, [loadJobs]);
 
   async function logout() {
@@ -352,7 +347,7 @@ export function OwnerDashboard() {
                         // eslint-disable-next-line @next/next/no-img-element
                         <img
                           key={`${file.id}-${file.size}-${file.enhanced}`}
-                          src={`/api/jobs/${selected.id}/files/${file.id}?t=${file.size}`}
+                          src={`/api/jobs/${selected.id}/files/${file.id}?thumb=1&t=${file.size}`}
                           alt={file.originalName}
                           className="mt-3 max-h-56 w-full rounded-xl object-contain bg-paper"
                         />

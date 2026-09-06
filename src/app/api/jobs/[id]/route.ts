@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isOwnerAuthenticated } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { deletePrintJob, getPrintJob, updatePrintJobStatus } from "@/lib/db";
 import { JOB_STATUSES, type JobStatus } from "@/lib/jobs";
 
 type Params = { params: Promise<{ id: string }> };
@@ -11,10 +11,7 @@ export async function GET(_req: NextRequest, { params }: Params) {
   }
 
   const { id } = await params;
-  const job = await prisma.printJob.findUnique({
-    where: { id },
-    include: { files: { orderBy: { createdAt: "asc" } } },
-  });
+  const job = await getPrintJob(id);
 
   if (!job) {
     return NextResponse.json({ error: "Job not found" }, { status: 404 });
@@ -36,11 +33,8 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     return NextResponse.json({ error: "Invalid status" }, { status: 400 });
   }
 
-  const job = await prisma.printJob.update({
-    where: { id },
-    data: { status },
-    include: { files: true },
-  });
+  const job = await updatePrintJobStatus(id, status);
+  if (!job) return NextResponse.json({ error: "Job not found" }, { status: 404 });
 
   return NextResponse.json({ job });
 }
@@ -51,6 +45,6 @@ export async function DELETE(_req: NextRequest, { params }: Params) {
   }
 
   const { id } = await params;
-  await prisma.printJob.delete({ where: { id } });
+  await deletePrintJob(id);
   return NextResponse.json({ ok: true });
 }

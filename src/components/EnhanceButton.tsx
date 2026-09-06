@@ -2,7 +2,6 @@
 
 import { useState } from "react";
 import { Download, Loader2, Wand2 } from "lucide-react";
-import { enhanceDocumentImage } from "@/lib/document-enhance";
 
 type Props = {
   jobId: string;
@@ -32,27 +31,17 @@ export function EnhanceButton({
     setLoading(true);
     setError("");
     try {
-      const srcRes = await fetch(`/api/jobs/${jobId}/files/${fileId}`);
-      if (!srcRes.ok) throw new Error("Could not load image");
-      const blob = await srcRes.blob();
-
-      const enhancedBlob = await enhanceDocumentImage(blob);
-
-      const form = new FormData();
-      form.set("file", enhancedBlob, "enhanced.jpg");
-
-      const saveRes = await fetch(
+      const res = await fetch(
         `/api/jobs/${jobId}/files/${fileId}/enhance`,
-        { method: "PUT", body: form }
+        { method: "POST" }
       );
-      const data = await saveRes.json();
-      if (!saveRes.ok) throw new Error(data.error || "Save failed");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Enhance failed");
 
       const newSize = data.file?.size ?? Date.now();
       setCacheBust(newSize);
       onDone();
 
-      // Auto-download for immediate printing
       const link = document.createElement("a");
       link.href = `/api/jobs/${jobId}/files/${fileId}?download=1&v=${newSize}`;
       link.download = printName;
@@ -74,7 +63,7 @@ export function EnhanceButton({
           onClick={runEnhance}
           disabled={loading}
           className="inline-flex items-center gap-1.5 rounded-full bg-accent px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-accent-dark disabled:opacity-60"
-          title="Auto crop and brighten like a document scanner"
+          title="Server-side auto crop and brighten"
         >
           {loading ? (
             <>

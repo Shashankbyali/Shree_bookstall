@@ -1,8 +1,5 @@
-import fs from "fs/promises";
 import path from "path";
 import { randomUUID } from "crypto";
-
-export const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 
 const ALLOWED_MIME = new Set([
   "image/jpeg",
@@ -28,19 +25,7 @@ export function isAllowedMime(mime: string) {
 
 export { isImageMime, formatBytes } from "./file-utils";
 
-export async function ensureUploadDir() {
-  await fs.mkdir(UPLOAD_DIR, { recursive: true });
-}
-
 export function buildStoredName(originalName: string) {
   const ext = path.extname(originalName).toLowerCase() || "";
   return `${Date.now()}-${randomUUID()}${ext}`;
-}
-
-export function resolveUploadPath(storedName: string) {
-  const full = path.join(UPLOAD_DIR, storedName);
-  if (!full.startsWith(UPLOAD_DIR)) {
-    throw new Error("Invalid file path");
-  }
-  return full;
 }

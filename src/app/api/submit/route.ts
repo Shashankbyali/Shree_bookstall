@@ -1,14 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import fs from "fs/promises";
-import { prisma } from "@/lib/db";
+import { createPrintJob } from "@/lib/db";
 import {
   MAX_FILE_SIZE,
   MAX_FILES,
   buildStoredName,
-  ensureUploadDir,
   isAllowedMime,
-  resolveUploadPath,
 } from "@/lib/uploads";
+import { uploadStoredFile, deleteStoredFile } from "@/lib/storage";
 
 export const runtime = "nodejs";
 
@@ -69,45 +67,49 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    await ensureUploadDir();
-
     const saved: {
       originalName: string;
       storedName: string;
       mimeType: string;
       size: number;
     }[] = [];
+    const uploadedStoredNames: string[] = [];
 
-    for (const file of files) {
-      const mime = file.type || guessMimeFromName(file.name) || "application/octet-stream";
-      const storedName = buildStoredName(file.name);
-      const buffer = Buffer.from(await file.arrayBuffer());
-      await fs.writeFile(resolveUploadPath(storedName), buffer);
-      saved.push({
-        originalName: file.name,
-        storedName,
-        mimeType: mime,
-        size: file.size,
-      });
-    }
+    try {
+      const results = await Promise.all(
+        files.map(async (file) => {
+          const mime =
+            file.type || guessMimeFromName(file.name) || "application/octet-stream";
+          const storedName = buildStoredName(file.name);
+          const buffer = Buffer.from(await file.arrayBuffer());
+          await uploadStoredFile(storedName, buffer, mime);
+          uploadedStoredNames.push(storedName);
+          return {
+            originalName: file.name,
+            storedName,
+            mimeType: mime,
+            size: file.size,
+          };
+        })
+      );
+      saved.push(...results);
 
-    const job = await prisma.printJob.create({
-      data: {
+      const job = await createPrintJob({
         name,
         phone: phoneDigits,
         notes: notes || null,
-        files: {
-          create: saved,
-        },
-      },
-      include: { files: true },
-    });
+        files: saved,
+      });
 
-    return NextResponse.json({
-      ok: true,
-      jobId: job.id,
-      fileCount: job.files.length,
-    });
+      return NextResponse.json({
+        ok: true,
+        jobId: job.id,
+        fileCount: job.files.length,
+      });
+    } catch (error) {
+      await Promise.allSettled(uploadedStoredNames.map((name) => deleteStoredFile(name)));
+      throw error;
+    }
   } catch (err) {
     console.error("Submit error:", err);
     return NextResponse.json(

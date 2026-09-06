@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isOwnerAuthenticated } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { listPrintJobs } from "@/lib/db";
 import { JOB_STATUSES, type JobStatus } from "@/lib/jobs";
 
 export async function GET(req: NextRequest) {
@@ -14,15 +14,7 @@ export async function GET(req: NextRequest) {
       ? { status }
       : undefined;
 
-  const jobs = await prisma.printJob.findMany({
-    where,
-    include: {
-      files: {
-        orderBy: { createdAt: "asc" },
-      },
-    },
-    orderBy: { createdAt: "desc" },
-  });
+  const jobs = await listPrintJobs(where?.status);
 
   return NextResponse.json({ jobs });
 }
