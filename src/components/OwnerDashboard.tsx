@@ -13,6 +13,7 @@ import {
   Phone,
   RefreshCw,
   ScanLine,
+  Trash2,
 } from "lucide-react";
 import {
   JOB_STATUSES,
@@ -73,11 +74,20 @@ export function OwnerDashboard() {
   }, [filter, router]);
 
   useEffect(() => {
-    void loadJobs(false);
-    const id = setInterval(() => {
-      void loadJobs(true);
-    }, 20000);
-    return () => clearInterval(id);
+    // The first load and the poll both run from the timer callback rather than
+    // synchronously in the effect body, which would trigger cascading renders
+    // (react-hooks/set-state-in-effect).
+    let active = true;
+    const tick = (silent: boolean) => {
+      if (active) void loadJobs(silent);
+    };
+    const first = setTimeout(() => tick(false), 0);
+    const id = setInterval(() => tick(true), 20000);
+    return () => {
+      active = false;
+      clearTimeout(first);
+      clearInterval(id);
+    };
   }, [loadJobs]);
 
   async function logout() {
@@ -95,12 +105,27 @@ export function OwnerDashboard() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Update failed");
-      setJobs((prev) =>
-        prev.map((j) => (j.id === jobId ? data.job : j))
-      );
-      await loadJobs();
+      setJobs((prev) => prev.map((j) => (j.id === jobId ? data.job : j)));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Update failed");
+    } finally {
+      setUpdating(false);
+    }
+  }
+
+  async function deleteJob(jobId: string) {
+    if (!window.confirm("Delete this job and its files? This cannot be undone.")) return;
+    setUpdating(true);
+    try {
+      const res = await fetch(`/api/jobs/${jobId}`, { method: "DELETE" });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || "Delete failed");
+      }
+      setSelectedId(null);
+      await loadJobs();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Delete failed");
     } finally {
       setUpdating(false);
     }
@@ -265,6 +290,15 @@ export function OwnerDashboard() {
                     {selected.notes}
                   </p>
                 )}
+                <button
+                  type="button"
+                  onClick={() => deleteJob(selected.id)}
+                  disabled={updating}
+                  className="mt-3 inline-flex items-center gap-1.5 rounded-full border border-rose-200 px-3 py-1.5 text-xs font-semibold text-rose-700 transition hover:bg-rose-50 disabled:opacity-50"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Delete job &amp; files
+                </button>
               </div>
 
               <div>
@@ -311,7 +345,7 @@ export function OwnerDashboard() {
                           </p>
                           <p className="text-xs text-muted">
                             {formatBytes(file.size)}
-                            {file.enhanced ? " · scanner enhanced" : ""}
+                            {file.enhanced ? " · edited (original kept)" : ""}
                           </p>
                           <div className="mt-2 flex flex-wrap gap-2">
                             <a

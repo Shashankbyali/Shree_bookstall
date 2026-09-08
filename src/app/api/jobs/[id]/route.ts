@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isOwnerAuthenticated } from "@/lib/auth";
 import { deletePrintJob, getPrintJob, updatePrintJobStatus } from "@/lib/db";
+import { deleteStoredFiles } from "@/lib/storage";
 import { JOB_STATUSES, type JobStatus } from "@/lib/jobs";
 
 type Params = { params: Promise<{ id: string }> };
@@ -26,7 +27,12 @@ export async function PATCH(req: NextRequest, { params }: Params) {
   }
 
   const { id } = await params;
-  const body = await req.json();
+  let body: { status?: unknown };
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid request." }, { status: 400 });
+  }
   const status = String(body.status ?? "");
 
   if (!JOB_STATUSES.includes(status as JobStatus)) {
@@ -45,6 +51,11 @@ export async function DELETE(_req: NextRequest, { params }: Params) {
   }
 
   const { id } = await params;
-  await deletePrintJob(id);
-  return NextResponse.json({ ok: true });
+  // Remove the stored objects too, otherwise every deleted job leaves its
+  // uploads orphaned in the bucket forever.
+  const storedNames = await deletePrintJob(id);
+  await deleteStoredFiles(storedNames).catch((error) =>
+    console.error(`[Job] storage cleanup failed for ${id}:`, error)
+  );
+  return NextResponse.json({ ok: true, removedFiles: storedNames.length });
 }

@@ -1,288 +1,211 @@
-import sharp from "sharp";
+import sharp, { type Sharp } from "sharp";
+import {
+  ANALYSIS_MAX_SIDE,
+  analysisFromInterleaved,
+  detectDocumentBounds,
+  fromNormalizedCrop,
+  toNormalizedCrop,
+  type NormalizedCrop,
+} from "./document-detect";
 
-type Bounds = { x: number; y: number; w: number; h: number };
+/** Tunables the owner can nudge from the dashboard. */
+export type EnhanceSettings = {
+  /** Normalised crop rect. Omit to auto-detect. */
+  crop?: NormalizedCrop;
+  /** 0.5 (darker) .. 2 (brighter), 1 = leave alone. */
+  brightness: number;
+  /** 0.5 (flatter) .. 2 (punchier), 1 = leave alone. */
+  contrast: number;
+  /** Print as pure greyscale — smaller files and crisper text on a mono laser. */
+  grayscale: boolean;
+};
 
-function otsuThreshold(gray: Uint8Array): number {
-  const hist = new Int32Array(256);
-  for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
+export const DEFAULT_ENHANCE_SETTINGS: EnhanceSettings = {
+  brightness: 1,
+  contrast: 1,
+  grayscale: false,
+};
 
-  const total = gray.length;
-  let sum = 0;
-  for (let i = 0; i < 256; i++) sum += i * hist[i];
+const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
 
-  let sumB = 0;
-  let wB = 0;
-  let maxVar = 0;
-  let threshold = 128;
-
-  for (let t = 0; t < 256; t++) {
-    wB += hist[t];
-    if (wB === 0) continue;
-    const wF = total - wB;
-    if (wF === 0) break;
-    sumB += t * hist[t];
-    const mB = sumB / wB;
-    const mF = (sum - sumB) / wF;
-    const variance = wB * wF * (mB - mF) ** 2;
-    if (variance > maxVar) {
-      maxVar = variance;
-      threshold = t;
-    }
-  }
-  return threshold;
-}
-
-function detectPaperBounds(gray: Uint8Array, width: number, height: number): Bounds {
-  // CONSERVATIVE: Start with Otsu threshold without aggressive adjustment
-  const threshold = otsuThreshold(gray);
-  const mask = new Uint8Array(width * height);
-
-  for (let i = 0; i < gray.length; i++) {
-    if (gray[i] >= threshold) mask[i] = 1;
-  }
-
-  // Light erosion to disconnect obvious noise
-  const eroded = new Uint8Array(mask.length);
-  const r = 1;
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const i = y * width + x;
-      if (!mask[i]) continue;
-      let keep = true;
-      for (let dy = -r; dy <= r && keep; dy++) {
-        for (let dx = -r; dx <= r && keep; dx++) {
-          const nx = x + dx;
-          const ny = y + dy;
-          if (nx < 0 || ny < 0 || nx >= width || ny >= height || !mask[ny * width + nx]) {
-            keep = false;
-          }
-        }
-      }
-      if (keep) eroded[i] = 1;
-    }
-  }
-
-  const rowCount = new Int32Array(height);
-  const colCount = new Int32Array(width);
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      if (eroded[y * width + x]) {
-        rowCount[y]++;
-        colCount[x]++;
-      }
-    }
-  }
-
-  // DOCUMENT-OPTIMIZED: Prefer tall/portrait aspect ratios typical of documents
-  // Documents are usually taller than wide or roughly square
-  const rowMin = Math.floor(height * 0.2); // At least 20% vertical coverage
-  const colMin = Math.floor(width * 0.15); // At least 15% horizontal coverage
-
-  const findBand = (counts: Int32Array, minVal: number) => {
-    let bestStart = 0;
-    let bestLen = 0;
-    let start = -1;
-    for (let i = 0; i < counts.length; i++) {
-      if (counts[i] >= minVal) {
-        if (start < 0) start = i;
-      } else if (start >= 0) {
-        const len = i - start;
-        // Strong preference for bands that are more central (avoid edge detection)
-        const distanceFromCenter = Math.abs(i + len/2 - counts.length/2);
-        const normalizedDistance = distanceFromCenter / counts.length;
-        // Prefer central bands and longer bands
-        const score = len * (1 - normalizedDistance);
-
-        if (score > bestLen * (1 - Math.abs(bestStart + bestLen/2 - counts.length/2) / counts.length) || bestLen === 0) {
-          bestLen = len;
-          bestStart = start;
-        }
-        start = -1;
-      }
-    }
-    if (start >= 0) {
-      const len = counts.length - start;
-      const distanceFromCenter = Math.abs(start + len/2 - counts.length/2);
-      const normalizedDistance = distanceFromCenter / counts.length;
-      const score = len * (1 - normalizedDistance);
-
-      if (score > bestLen * (1 - Math.abs(bestStart + bestLen/2 - counts.length/2) / counts.length) || bestLen === 0) {
-        bestLen = len;
-        bestStart = start;
-      }
-    }
-    return bestLen > 0 ? { start: bestStart, end: bestStart + bestLen - 1 } : null;
-  };
-
-  const rowBand = findBand(rowCount, rowMin);
-  if (!rowBand) return { x: 0, y: 0, w: width, h: height };
-
-  const colSlice = new Int32Array(width);
-  for (let x = 0; x < width; x++) {
-    let c = 0;
-    for (let y = rowBand.start; y <= rowBand.end; y++) {
-      if (eroded[y * width + x]) c++;
-    }
-    colSlice[x] = c;
-  }
-
-  const colBand = findBand(colSlice, colMin);
-  if (!colBand) return { x: 0, y: 0, w: width, h: height };
-
-  // ENSURE DOCUMENT-LIKE ASPECT RATIO: Prefer taller-than-wide for documents
-  let detectedX = colBand.start;
-  let detectedY = rowBand.start;
-  let detectedW = colBand.end - colBand.start + 1;
-  let detectedH = rowBand.end - rowBand.start + 1;
-
-  const aspectRatio = detectedW / detectedH;
-
-  // If detected region is too wide, try to make it more document-like
-  if (aspectRatio > 2.0) { // Wider than 2:1
-    // Try to reduce width by finding narrower central region
-    const centerX = detectedX + detectedW / 2;
-    const targetWidth = Math.min(detectedW, detectedH * 1.8); // Aim for max 1.8:1
-    detectedX = Math.max(0, Math.floor(centerX - targetWidth / 2));
-    detectedW = Math.min(width - detectedX, targetWidth);
-  } else if (aspectRatio < 0.5) { // Taller than 2:1 (might be over-cropped vertically)
-    // Try to increase width slightly
-    const centerY = detectedY + detectedH / 2;
-    const targetHeight = Math.min(detectedH, detectedW * 2.0); // Don't let height exceed 2x width
-    detectedY = Math.max(0, Math.floor(centerY - targetHeight / 2));
-    detectedH = Math.min(height - detectedY, targetHeight);
-  }
-
-  // ADD PADDING: Include some margin around detected content
-  const pad = Math.max(2, Math.round(Math.min(width, height) * 0.01)); // 1% padding
-  const finalX = Math.max(0, detectedX - pad);
-  const finalY = Math.max(0, detectedY - pad);
-  const finalW = Math.min(width, detectedW + pad * 2);
-  const finalH = Math.min(height, detectedH + pad * 2);
-
-  // FINAL SANITY CHECK: Ensure we have a reasonable detection
-  const finalAspectRatio = finalW / finalH;
-  const finalAreaRatio = (finalW * finalH) / (width * height);
-
-  // If detection is too small or too extreme, fall back to a more conservative approach
-  if (finalAreaRatio < 0.05 || finalAspectRatio > 3 || finalAspectRatio < 0.3) {
-    // Fallback: detect central region with document-like proportions
-    const fallbackW = Math.floor(width * 0.8);
-    const fallbackH = Math.floor(fallbackW * 1.3); // Aspect ratio ~1.3:1 (taller than wide)
-    const fallbackX = Math.floor((width - fallbackW) / 2);
-    const fallbackY = Math.floor((height - fallbackH) / 2);
-
-    return {
-      x: fallbackX,
-      y: fallbackY,
-      w: fallbackW,
-      h: fallbackH,
-    };
-  }
-
+export function normalizeSettings(input: unknown): EnhanceSettings {
+  const raw = (input ?? {}) as Record<string, unknown>;
   return {
-    x: finalX,
-    y: finalY,
-    w: finalW,
-    h: finalH,
+    brightness: clamp(Number(raw.brightness ?? 1) || 1, 0.5, 2),
+    contrast: clamp(Number(raw.contrast ?? 1) || 1, 0.5, 2),
+    grayscale: raw.grayscale === true,
   };
 }
 
-function clampExtract(
-  bounds: Bounds,
-  imgW: number,
-  imgH: number
-): { left: number; top: number; width: number; height: number } {
-  const left = Math.max(0, Math.min(bounds.x, imgW - 1));
-  const top = Math.max(0, Math.min(bounds.y, imgH - 1));
-  const width = Math.max(1, Math.min(bounds.w, imgW - left));
-  const height = Math.max(1, Math.min(bounds.h, imgH - top));
-  return { left, top, width, height };
+/** Decode + upright the image once, so every step sees the same orientation. */
+function decode(input: Buffer) {
+  // `flatten` is essential: without it sharp composites alpha onto black, so a
+  // transparent PNG or screenshot prints as a grey/black rectangle.
+  return sharp(input, { failOn: "error" })
+    .rotate()
+    .flatten({ background: "#ffffff" });
 }
 
-/** Server-side document scan: auto-crop + brighten using sharp. */
-export async function enhanceDocumentBuffer(input: Buffer): Promise<Buffer> {
-  try {
-    console.log(`[EnhanceBuffer] Starting enhancement, input size: ${input.length} bytes`);
+async function analyse(input: Buffer) {
+  const { data, info } = await decode(input)
+    .resize(ANALYSIS_MAX_SIDE, ANALYSIS_MAX_SIDE, {
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .removeAlpha()
+    .toColourspace("srgb")
+    .raw()
+    .toBuffer({ resolveWithObject: true });
 
-    const rotated = sharp(input).rotate();
-    const meta = await rotated.metadata();
-    const imgW = meta.width ?? 1;
-    const imgH = meta.height ?? 1;
+  return analysisFromInterleaved(data, info.width, info.height, info.channels);
+}
 
-    console.log(`[EnhanceBuffer] Image dimensions: ${imgW}x${imgH}`);
+/**
+ * Auto-detect the page rectangle, as a normalised crop.
+ * Returns `null` when no convincing page is found — the caller should then not
+ * crop at all rather than guess and cut off content.
+ */
+export async function detectCrop(input: Buffer): Promise<NormalizedCrop | null> {
+  const analysis = await analyse(input);
+  const bounds = detectDocumentBounds(analysis);
+  return bounds ? toNormalizedCrop(bounds, analysis.width, analysis.height) : null;
+}
 
-    const analysisW = 1400;
-    const { data, info } = await rotated
-      .clone()
-      .resize(analysisW, undefined, { withoutEnlargement: true })
-      .greyscale()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
+/** Paper white / ink black targets. Not pure 255/0, to keep some tonal detail. */
+const PAPER_TARGET = 246;
+const INK_TARGET = 12;
 
-    console.log(`[EnhanceBuffer] Analysis dimensions: ${info.width}x${info.height}`);
+/**
+ * Work out the linear transform that puts this image's paper at white and its
+ * ink at black. Returns null when the image is too flat to stretch safely (a
+ * blank or solid-colour scan), where a huge gain would just amplify noise.
+ */
+async function measureLevels(
+  pipeline: Sharp
+): Promise<{ gain: number; offset: number } | null> {
+  const { data } = await pipeline
+    .clone()
+    .resize(600, 600, { fit: "inside", withoutEnlargement: true })
+    .greyscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
 
-    const bounds = detectPaperBounds(data, info.width, info.height);
-    console.log(`[EnhanceBuffer] Detected bounds:`, bounds);
+  const hist = new Int32Array(256);
+  for (let i = 0; i < data.length; i++) hist[data[i]]++;
 
-    const scaleX = imgW / info.width;
-    const scaleY = imgH / info.height;
-
-    const extract = clampExtract(
-      {
-        x: Math.floor(bounds.x * scaleX),
-        y: Math.floor(bounds.y * scaleY),
-        w: Math.ceil(bounds.w * scaleX),
-        h: Math.ceil(bounds.h * scaleY),
-      },
-      imgW,
-      imgH
-    );
-
-    console.log(`[EnhanceBuffer] Extract area:`, extract);
-
-    // If crop would barely change anything, fall back to sharp trim
-    const cropArea = extract.width * extract.height;
-    const fullArea = imgW * imgH;
-    // IMPROVED: Allow more aggressive cropping
-    const useExtract = cropArea < fullArea * 0.98 && cropArea > fullArea * 0.05;
-
-    console.log(`[EnhanceBuffer] Crop area ratio: ${(cropArea/fullArea*100).toFixed(1)}%, useExtract: ${useExtract}`);
-
-    let pipeline = rotated.clone();
-    if (useExtract) {
-      pipeline = pipeline.extract(extract);
-      console.log(`[EnhanceBuffer] Using extract: {left: ${extract.left}, top: ${extract.top}, width: ${extract.width}, height: ${extract.height}}`);
-    } else {
-      pipeline = pipeline.trim({ threshold: 18 });
-      console.log(`[EnhanceBuffer] Using trim fallback`);
+  const pct = (p: number) => {
+    const target = Math.floor(data.length * p);
+    let seen = 0;
+    for (let v = 0; v < 256; v++) {
+      seen += hist[v];
+      if (seen > target) return v;
     }
+    return 255;
+  };
 
-    const result = await pipeline
-      .normalize()
-      .modulate({ brightness: 1.1, saturation: 0.35 })
-      .linear(1.3, -25)
-      .jpeg({ quality: 90, mozjpeg: true })
-      .toBuffer();
+  // 6th percentile tracks the ink, 88th the paper. Using the extremes instead
+  // would let a single dust speck or blown highlight set the whole mapping.
+  const ink = pct(0.06);
+  const paper = pct(0.88);
+  if (paper - ink < 12) return null;
 
-    console.log(`[EnhanceBuffer] Enhancement completed, output size: ${result.length} bytes`);
-    return result;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    const stack = error instanceof Error ? error.stack : undefined;
-    console.error(`[EnhanceBuffer] Enhancement failed:`, {
-      error: message,
-      stack,
-      inputSize: input.length
-    });
-    throw error;
+  const gain = (PAPER_TARGET - INK_TARGET) / (paper - ink);
+  // Cap the gain so a very flat original does not turn into pure noise.
+  const capped = Math.min(gain, 4);
+  return { gain: capped, offset: INK_TARGET - capped * ink };
+}
+
+export type EnhanceResult = {
+  buffer: Buffer;
+  /** The crop actually applied, or null when the image was left full-frame. */
+  crop: NormalizedCrop | null;
+  width: number;
+  height: number;
+};
+
+/**
+ * Document scan: crop to the page, then lift the paper to white and deepen the
+ * ink. Always call this with the *original* upload so repeated adjustments never
+ * compound on top of an already-processed image.
+ */
+export async function enhanceDocumentBuffer(
+  input: Buffer,
+  settings: EnhanceSettings = DEFAULT_ENHANCE_SETTINGS
+): Promise<EnhanceResult> {
+  const meta = await decode(input).metadata();
+  const imgW = meta.width ?? 0;
+  const imgH = meta.height ?? 0;
+  if (!imgW || !imgH) throw new Error("Image has no usable dimensions.");
+
+  const crop = settings.crop ?? (await detectCrop(input));
+
+  const cropped = () => {
+    let p = decode(input);
+    if (crop) {
+      const extract = fromNormalizedCrop(crop, imgW, imgH);
+      // A crop that keeps essentially the whole frame is not worth the re-encode.
+      if (extract.width * extract.height < imgW * imgH * 0.995) p = p.extract(extract);
+    }
+    return p;
+  };
+
+  let pipeline = cropped();
+
+  // Document levels: find where the paper and the ink actually sit, then stretch
+  // so paper becomes near-white and ink near-black. This is what makes a dim
+  // photo look scanned; sharp's normalize() only stretches to the extremes,
+  // which on a noisy photo is already 0..255 and therefore does nothing.
+  const levels = await measureLevels(cropped());
+  if (levels) pipeline = pipeline.linear(levels.gain, levels.offset);
+
+  if (settings.grayscale) {
+    // toColourspace is needed as well as greyscale(): later ops re-expand to
+    // sRGB, which would emit a 3-channel JPEG that only looks grey.
+    pipeline = pipeline.greyscale().toColourspace("b-w");
+  } else {
+    // Documents photograph with a colour cast from room lighting. Pulling
+    // saturation down neutralises it while keeping highlighter and stamps
+    // visible.
+    pipeline = pipeline.modulate({ saturation: 0.6 });
   }
+
+  // Contrast pivots around mid-grey; brightness is a plain offset afterwards, so
+  // the two controls stay independent instead of fighting each other.
+  const a = settings.contrast;
+  const b = 128 * (1 - settings.contrast) + (settings.brightness - 1) * 96;
+  if (a !== 1 || b !== 0) pipeline = pipeline.linear(a, b);
+
+  if (settings.grayscale) pipeline = pipeline.toColourspace("b-w");
+
+  const { data, info } = await pipeline
+    .jpeg({ quality: 88, mozjpeg: true, chromaSubsampling: "4:4:4" })
+    .toBuffer({ resolveWithObject: true });
+
+  return { buffer: data, crop: crop ?? null, width: info.width, height: info.height };
 }
 
 /** Fast thumbnail for dashboard previews. */
 export async function createThumbnailBuffer(input: Buffer): Promise<Buffer> {
-  return sharp(input)
-    .rotate()
+  return decode(input)
     .resize(480, 480, { fit: "inside", withoutEnlargement: true })
     .jpeg({ quality: 72, mozjpeg: true })
     .toBuffer();
+}
+
+/** Larger preview for the crop editor — enough detail to place the handles. */
+export async function createPreviewBuffer(input: Buffer): Promise<Buffer> {
+  return decode(input)
+    .resize(1400, 1400, { fit: "inside", withoutEnlargement: true })
+    .jpeg({ quality: 80, mozjpeg: true })
+    .toBuffer();
+}
+
+/** True when sharp can actually decode the bytes (guards against spoofed types). */
+export async function isDecodableImage(input: Buffer): Promise<boolean> {
+  try {
+    const meta = await sharp(input).metadata();
+    return Boolean(meta.width && meta.height);
+  } catch {
+    return false;
+  }
 }

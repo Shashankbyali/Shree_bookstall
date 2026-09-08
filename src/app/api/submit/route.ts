@@ -1,139 +1,89 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createPrintJob } from "@/lib/db";
-import {
-  MAX_FILE_SIZE,
-  MAX_FILES,
-  buildStoredName,
-  isAllowedMime,
-} from "@/lib/uploads";
-import { uploadStoredFile, deleteStoredFile } from "@/lib/storage";
+import { createPrintJob, type NewPrintFile } from "@/lib/db";
+import { deleteStoredFiles, statStoredFile } from "@/lib/storage";
+import { verifyUploadTicket } from "@/lib/uploads";
+import { rateLimit } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
 
+/**
+ * Record a print job for files the browser has already uploaded to Supabase via
+ * `/api/uploads`. Only metadata crosses this endpoint, which keeps it well under
+ * Vercel's 4.5 MB request body ceiling no matter how big the documents are.
+ */
 export async function POST(req: NextRequest) {
+  const limited = rateLimit(req, "submit", { limit: 20, windowMs: 60_000 });
+  if (limited) return limited;
+
+  let body: { name?: unknown; phone?: unknown; notes?: unknown; ticket?: unknown };
   try {
-    const form = await req.formData();
-    const name = String(form.get("name") ?? "").trim();
-    const phone = String(form.get("phone") ?? "").trim();
-    const notes = String(form.get("notes") ?? "").trim();
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid request." }, { status: 400 });
+  }
 
-    if (!name || name.length < 2) {
-      return NextResponse.json(
-        { error: "Please enter your full name." },
-        { status: 400 }
-      );
-    }
+  const name = String(body.name ?? "").trim();
+  const phone = String(body.phone ?? "").trim();
+  const notes = String(body.notes ?? "").trim();
 
-    const phoneDigits = phone.replace(/\D/g, "");
-    if (phoneDigits.length < 10) {
-      return NextResponse.json(
-        { error: "Please enter a valid 10-digit phone number." },
-        { status: 400 }
-      );
-    }
+  if (name.length < 2 || name.length > 120) {
+    return NextResponse.json({ error: "Please enter your full name." }, { status: 400 });
+  }
 
-    const files = form
-      .getAll("files")
-      .filter((f): f is File => f instanceof File && f.size > 0);
+  const phoneDigits = phone.replace(/\D/g, "");
+  if (phoneDigits.length < 10 || phoneDigits.length > 15) {
+    return NextResponse.json(
+      { error: "Please enter a valid 10-digit phone number." },
+      { status: 400 }
+    );
+  }
+  if (notes.length > 1000) {
+    return NextResponse.json({ error: "Please shorten your notes." }, { status: 400 });
+  }
 
-    if (files.length === 0) {
-      return NextResponse.json(
-        { error: "Please upload at least one file." },
-        { status: 400 }
-      );
-    }
+  const ticket = typeof body.ticket === "string" ? body.ticket : "";
+  const expected = ticket ? await verifyUploadTicket(ticket) : null;
+  if (!expected || expected.length === 0) {
+    return NextResponse.json(
+      { error: "Your upload session expired. Please pick the files again." },
+      { status: 400 }
+    );
+  }
 
-    if (files.length > MAX_FILES) {
-      return NextResponse.json(
-        { error: `You can upload up to ${MAX_FILES} files.` },
-        { status: 400 }
-      );
-    }
+  // Confirm each object really landed in storage before promising the shop that
+  // the job exists, and take the size from storage rather than from the client.
+  const stats = await Promise.all(expected.map((f) => statStoredFile(f.storedName)));
+  const missing = expected.filter((_, i) => !stats[i]);
+  if (missing.length > 0) {
+    return NextResponse.json(
+      { error: `${missing.length} file(s) did not finish uploading. Please try again.` },
+      { status: 400 }
+    );
+  }
 
-    for (const file of files) {
-      if (file.size > MAX_FILE_SIZE) {
-        return NextResponse.json(
-          { error: `${file.name} is too large (max 25MB).` },
-          { status: 400 }
-        );
-      }
-      if (!isAllowedMime(file.type) && !guessMimeFromName(file.name)) {
-        return NextResponse.json(
-          {
-            error: `${file.name} type is not supported. Use PDF, images, Word, PPT, or text.`,
-          },
-          { status: 400 }
-        );
-      }
-    }
+  const files: NewPrintFile[] = expected.map((f, i) => ({
+    originalName: f.originalName,
+    storedName: f.storedName,
+    mimeType: f.mimeType,
+    size: stats[i]?.size || f.size,
+  }));
 
-    const saved: {
-      originalName: string;
-      storedName: string;
-      mimeType: string;
-      size: number;
-    }[] = [];
-    const uploadedStoredNames: string[] = [];
-
-    try {
-      const results = await Promise.all(
-        files.map(async (file) => {
-          const mime =
-            file.type || guessMimeFromName(file.name) || "application/octet-stream";
-          const storedName = buildStoredName(file.name);
-          const buffer = Buffer.from(await file.arrayBuffer());
-          await uploadStoredFile(storedName, buffer, mime);
-          uploadedStoredNames.push(storedName);
-          return {
-            originalName: file.name,
-            storedName,
-            mimeType: mime,
-            size: file.size,
-          };
-        })
-      );
-      saved.push(...results);
-
-      const job = await createPrintJob({
-        name,
-        phone: phoneDigits,
-        notes: notes || null,
-        files: saved,
-      });
-
-      return NextResponse.json({
-        ok: true,
-        jobId: job.id,
-        fileCount: job.files.length,
-      });
-    } catch (error) {
-      await Promise.allSettled(uploadedStoredNames.map((name) => deleteStoredFile(name)));
-      throw error;
-    }
-  } catch (err) {
-    console.error("Submit error:", err);
+  try {
+    const job = await createPrintJob({
+      name,
+      phone: phoneDigits,
+      notes: notes || null,
+      files,
+    });
+    return NextResponse.json({ ok: true, jobId: job.id, fileCount: job.files.length });
+  } catch (error) {
+    // The upload succeeded but the job row did not, so nothing references these
+    // objects any more.
+    await deleteStoredFiles(files.map((f) => f.storedName)).catch(() => undefined);
+    console.error("Submit error:", error);
     return NextResponse.json(
       { error: "Could not submit print job. Please try again." },
       { status: 500 }
     );
   }
-}
-
-function guessMimeFromName(name: string): string | null {
-  const ext = name.split(".").pop()?.toLowerCase();
-  const map: Record<string, string> = {
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    png: "image/png",
-    webp: "image/webp",
-    heic: "image/heic",
-    heif: "image/heif",
-    pdf: "application/pdf",
-    doc: "application/msword",
-    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ppt: "application/vnd.ms-powerpoint",
-    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    txt: "text/plain",
-  };
-  return ext ? map[ext] ?? null : null;
 }

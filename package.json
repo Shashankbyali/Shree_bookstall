@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:enhance": "tsx scripts/test-enhance.mts",
+    "test:e2e": "tsx --env-file=.env scripts/test-e2e.mts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.0",
@@ -35,6 +37,7 @@
     "eslint": "^9",
     "eslint-config-next": "^16.2.12",
     "tailwindcss": "^4",
+    "tsx": "^4.23.13",
     "typescript": "^5"
   },
   "overrides": {
