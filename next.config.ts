@@ -15,14 +15,14 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: path.join(__dirname),
   },
-  // sharp loads libvips as a native .so at runtime. File tracing follows the
-  // JS require graph, so it ships @img/sharp-linux-x64 but misses the
-  // libvips-cpp.so inside its transitive @img/sharp-libvips-* dependency, and
-  // the image routes die with ERR_DLOPEN_FAILED on Vercel. Only the two routes
-  // that touch sharp need the extra weight.
+  // sharp's native addon dlopens libvips from a sibling @img/sharp-libvips-*
+  // package. That happens inside compiled code, not via require(), so file
+  // tracing never sees it and the image routes die on Vercel with
+  // ERR_DLOPEN_FAILED: libvips-cpp.so. Upstream fixes are open but unreleased
+  // (vercel/nft#595, vercel/next.js#97978); until then the binaries have to be
+  // pulled in by hand.
   outputFileTracingIncludes: {
-    "/api/jobs/[id]/files/[fileId]": ["node_modules/@img/**/*"],
-    "/api/jobs/[id]/files/[fileId]/enhance": ["node_modules/@img/**/*"],
+    "/**": ["node_modules/@img/**/*.so*", "node_modules/@img/**/*.node"],
   },
   experimental: {
     serverActions: {
